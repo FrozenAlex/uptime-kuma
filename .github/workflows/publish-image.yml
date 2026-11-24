@@ -1,0 +1,88 @@
+name: Publish hosting image
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: publish-hosting-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/frozenalex/uptime-kuma
+
+jobs:
+  build:
+    if: github.repository == 'FrozenAlex/uptime-kuma' && github.ref == 'refs/heads/master'
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - name: Build web interface
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+      - name: Build release image
+        run: |
+          docker build --file docker/dockerfile --target release \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$IMAGE:$GITHUB_SHA-$ARCH" .
+      - name: Start Kuma and verify the web interface
+        run: |
+          docker run --detach --name kuma --publish 127.0.0.1:3001:3001 \
+            --env UPTIME_KUMA_DB_TYPE=sqlite "$IMAGE:$GITHUB_SHA-$ARCH"
+          trap 'docker logs kuma; docker rm -f kuma' EXIT
+          until curl -fsS --max-time 5 http://127.0.0.1:3001/api/entry-page | jq -e '.type == "entryPage"'; do
+            if (( SECONDS >= 180 )); then exit 1; fi
+            sleep 2
+          done
+          asset=$(find dist/assets -type f -name '*.js' -print -quit)
+          test -n "$asset"
+          curl -fsS http://127.0.0.1:3001/ | grep -F 'id="app"'
+          curl -fsS "http://127.0.0.1:3001/${asset#dist/}" | cmp - "$asset"
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: docker push "$IMAGE:$GITHUB_SHA-$ARCH"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-platform tags
+        run: |
+          docker buildx imagetools create --tag "$IMAGE:sha-$GITHUB_SHA" --tag "$IMAGE:latest" \
+            "$IMAGE:$GITHUB_SHA-amd64" "$IMAGE:$GITHUB_SHA-arm64"
