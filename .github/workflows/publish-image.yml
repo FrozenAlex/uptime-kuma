@@ -61,7 +61,7 @@ jobs:
           done
           asset=$(find dist/assets -type f -name '*.js' -print -quit)
           test -n "$asset"
-          curl -fsS http://127.0.0.1:3001/ | grep -F 'id="app"'
+          curl -fsSL http://127.0.0.1:3001/ | grep -F 'id="app"'
           curl -fsS "http://127.0.0.1:3001/${asset#dist/}" | cmp - "$asset"
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:

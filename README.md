@@ -43,7 +43,7 @@ It is a temporary live demo, all data will be deleted after 10 minutes. Sponsore
 ```bash
 mkdir uptime-kuma
 cd uptime-kuma
-curl -o compose.yaml https://raw.githubusercontent.com/louislam/uptime-kuma/master/compose.yaml
+curl -fsSLO https://raw.githubusercontent.com/FrozenAlex/uptime-kuma/master/compose.yaml
 docker compose up -d
 ```
 
@@ -55,7 +55,7 @@ Uptime Kuma is now running on all network interfaces (e.g. http://localhost:3001
 ### 🐳 Docker Command
 
 ```bash
-docker run -d --restart=always -p 3001:3001 -v uptime-kuma:/app/data --name uptime-kuma louislam/uptime-kuma:2
+docker run -d --restart=always -p 3001:3001 -v uptime-kuma:/app/data --name uptime-kuma ghcr.io/frozenalex/uptime-kuma:latest
 ```
 
 Uptime Kuma is now running on all network interfaces (e.g. http://localhost:3001 or http://your-ip:3001).
