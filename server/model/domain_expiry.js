@@ -1,35 +1,34 @@
+const net = require("node:net");
+const { domainToASCII, domainToUnicode } = require("node:url");
 const { BeanModel } = require("redbean-node/dist/bean-model");
 const { R } = require("redbean-node");
 const { log, TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD } = require("../../src/util");
-const { parse: parseTld } = require("tldts");
+const { getHostname, parse: parseTld } = require("tldts");
 const { setting, setSetting } = require("../util");
 const { Notification } = require("../notification");
 const TranslatableError = require("../translatable-error");
 const dayjs = require("dayjs");
 const { Settings } = require("../settings");
 
+const tciWhoisTlds = new Set(["ru", "xn--p1ai", "su"]);
 let cacheRdapDnsData = null;
 let nextChecking = 0;
 let running = false;
 
 /**
- * Find the RDAP server for a given TLD
- * @param {string} tld TLD
- * @returns {string|null} First RDAP server found
+ * Select the registry lookup used by both the monitor editor and expiry checks.
+ * @param {string} tld Root TLD in ASCII
+ * @returns {Promise<((domain: string) => Promise<Date|null>)|null>} Expiry lookup, if supported
  */
-async function getRdapServer(tld) {
+async function getDomainExpiryLookup(tld) {
     const rdapDnsData = await getRdapDnsData();
     const services = rdapDnsData["services"] ?? [];
-    const rootTld = tld?.split(".").pop();
-    if (rootTld) {
-        for (const [tlds, urls] of services) {
-            if (tlds.includes(rootTld)) {
-                return urls[0];
-            }
+    for (const [tlds, urls] of services) {
+        if (tlds.includes(tld) && urls[0]) {
+            return (domain) => getRdapDomainExpiryDate(domain, urls[0]);
         }
     }
-    log.debug("rdap", `No RDAP server found for TLD ${tld}`);
-    return null;
+    return tciWhoisTlds.has(tld) ? getTciDomainExpiryDate : null;
 }
 
 /**
@@ -105,15 +104,10 @@ async function getOfflineRdapDnsData() {
 /**
  * Request RDAP server to retrieve the expiry date of a domain
  * @param {string} domain Domain to retrieve the expiry date from
+ * @param {string} rdapServer Registry base URL from IANA
  * @returns {Promise<(Date|null)>} Expiry date from RDAP server
  */
-async function getRdapDomainExpiryDate(domain) {
-    const tld = DomainExpiry.parseTld(domain).publicSuffix;
-    const rdapServer = await getRdapServer(tld);
-    if (rdapServer === null) {
-        log.warn("rdap", `No RDAP server found, TLD ${tld} not supported.`);
-        return null;
-    }
+async function getRdapDomainExpiryDate(domain, rdapServer) {
     const url = `${rdapServer}domain/${domain}`;
 
     let rdapInfos;
@@ -135,6 +129,45 @@ async function getRdapDomainExpiryDate(domain) {
         if (event["eventAction"] === "expiration") {
             return new Date(event["eventDate"]);
         }
+    }
+    return null;
+}
+
+/**
+ * Read the registration deadline from the domain's TCI WHOIS record.
+ * @param {string} domain Registrable ASCII domain
+ * @returns {Promise<Date|null>} Registration expiry in UTC
+ */
+async function getTciDomainExpiryDate(domain) {
+    const socket = net.createConnection({ host: "whois.tcinet.ru", port: 43, signal: AbortSignal.timeout(5000) });
+    try {
+        socket.write(domain + "\r\n");
+        let response = "";
+        for await (const chunk of socket) {
+            // latin1 preserves a one-to-one mapping between bytes and characters.
+            if (response.length + chunk.length > 64 * 1024) {
+                return null;
+            }
+            response += chunk.toString("latin1");
+        }
+        for (const record of response.split(/\r?\n[ \t]*\r?\n/)) {
+            const names = [...record.matchAll(/^domain:[ \t]*(\S+)[ \t]*$/gim)];
+            if (names.length !== 1 || names[0][1].toLowerCase() !== domain) {
+                continue;
+            }
+            const deadlines = [...record.matchAll(/^paid-till:[ \t]*(\S+)[ \t]*$/gim)];
+            if (deadlines.length !== 1) {
+                return null;
+            }
+            // Round-trip the registry's UTC timestamp to reject rolled-over dates such as February 30.
+            const iso = deadlines[0][1].replace(/(T\d\d:\d\d:\d\d)Z$/, "$1.000Z");
+            const expiry = new Date(iso);
+            return Number.isFinite(expiry.getTime()) && expiry.toISOString() === iso ? expiry : null;
+        }
+    } catch (error) {
+        log.debug("domain_expiry", `WHOIS lookup for ${domain} failed: ${error.message}`);
+    } finally {
+        socket.destroy();
     }
     return null;
 }
@@ -173,7 +206,16 @@ class DomainExpiry extends BeanModel {
      * @returns {Promise<DomainExpiry>} Domain bean
      */
     static async findByName(domain) {
-        return R.findOne("domain_expiry", "domain = ?", [domain]);
+        const ascii = domainToASCII(domain);
+        const bean = await R.findOne("domain_expiry", "domain = ?", [ascii]);
+        if (!bean && ascii.includes("xn--")) {
+            // Older monitors could cache the Unicode spelling of an RDAP domain.
+            const legacy = await R.findOne("domain_expiry", "domain = ?", [domainToUnicode(ascii)]);
+            if (legacy && domainToASCII(legacy.domain) === ascii) {
+                return legacy;
+            }
+        }
+        return bean;
     }
 
     /**
@@ -182,7 +224,7 @@ class DomainExpiry extends BeanModel {
      */
     static createByName(domain) {
         const d = R.dispense("domain_expiry");
-        d.domain = domain;
+        d.domain = domainToASCII(domain);
         return d;
     }
 
@@ -218,7 +260,7 @@ class DomainExpiry extends BeanModel {
             throw new TranslatableError("domain_expiry_unsupported_missing_target");
         }
 
-        const tld = parseTld(target);
+        const tld = parseTld(domainToASCII(getHostname(target) ?? ""));
 
         // It must be checked first, filter out non-ICANN domains.
         if (!tld.isIcann) {
@@ -228,11 +270,13 @@ class DomainExpiry extends BeanModel {
                 publicSuffix: tld.publicSuffix,
             });
         }
+        if (!tld.domain) {
+            throw new TranslatableError("domain_expiry_unsupported_missing_target");
+        }
 
         const publicSuffix = tld.publicSuffix;
         const rootTld = publicSuffix.split(".").pop();
-        const rdap = await getRdapServer(publicSuffix);
-        if (!rdap) {
+        if (!(await getDomainExpiryLookup(rootTld))) {
             throw new TranslatableError("domain_expiry_unsupported_unsupported_tld_no_rdap_endpoint", {
                 publicSuffix,
             });
@@ -260,14 +304,17 @@ class DomainExpiry extends BeanModel {
      * @returns {number} number of days remaining before expiry
      */
     get daysRemaining() {
-        return dayjs.utc(this.expiry).diff(dayjs.utc(), "day");
+        // redbean stores expiry as a local SQL datetime.
+        return dayjs(this.expiry).utc().diff(dayjs.utc(), "day");
     }
 
     /**
-     * @returns {Promise<(Date|null)>} Expiry date from RDAP
+     * @returns {Promise<(Date|null)>} Expiry date from the registry
      */
     async getExpiryDate() {
-        return getRdapDomainExpiryDate(this.domain);
+        const domain = domainToASCII(this.domain);
+        const lookup = await getDomainExpiryLookup(domain.split(".").pop());
+        return lookup ? lookup(domain) : null;
     }
 
     /**
@@ -285,11 +332,12 @@ class DomainExpiry extends BeanModel {
         } else if (bean) {
             expiryDate = await bean.getExpiryDate();
 
-            if (dayjs.utc(expiryDate).isAfter(dayjs.utc(bean.expiry))) {
+            if (dayjs.utc(expiryDate).isAfter(dayjs(bean.expiry))) {
                 bean.lastExpiryNotificationSent = null;
             }
 
-            bean.expiry = R.isoDateTimeMillis(expiryDate);
+            bean.domain = domainToASCII(bean.domain);
+            bean.expiry = expiryDate === null ? null : R.isoDateTimeMillis(expiryDate);
             bean.lastCheck = R.isoDateTimeMillis(dayjs.utc());
             await R.store(bean);
         }
